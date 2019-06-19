@@ -3,7 +3,7 @@ import torch
 import Decoder
 import Encoder
 from torch_utils import init_tensor_gpu_grad
-
+from torch import nn
 
 class GMMSVAE(nn.Module):
     def __init__(self, opts, encoderlayers, decoderlayers):
