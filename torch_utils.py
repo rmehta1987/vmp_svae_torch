@@ -24,10 +24,8 @@ def logdet(A):
     return 2. * torch.sum(torch.log(torch.diagonal(torch.cholesky(A), dim1=-2, dim2=-1)), axis=-1)
 
 
-
 def init_tensor_gpu_grad(org_tensor, trainable=True, device='cuda'):
 
-    new_tensor = org_tensor.to(device)
-    new_tensor.requires_grad = trainable
-
+    new_tensor = nn.Parameter(org_tensor.to(device))
+    
     return new_tensor

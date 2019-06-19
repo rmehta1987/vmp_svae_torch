@@ -4,15 +4,11 @@ from __future__ import print_function
 
 # import matplotlib.pyplot as plt
 import numpy as np
-import tensorflow as tf
 
-from data import make_minibatch
-from distributions import dirichlet, niw
-from helpers.logging_utils import generate_log_id
-from losses import weighted_mse, generate_missing_data_mask, imputation_mse   # , gaussian_logprob
-from models import svae
-from helpers.scheduling import create_schedule
-from visualisation.visualise_gmm import plot_clusters, plt
+import dirichlet, niw
+import torch
+import torch_utils
+
 
 """
 Variational Mixture of Gaussians, according to:
@@ -24,84 +20,84 @@ Variational Mixture of Gaussians, according to:
 
 def update_Nk(r_nk):
     # Bishop eq 10.51
-    return tf.reduce_sum(r_nk, axis=0, name='Nk_new')
+    return torch.sum(r_nk, dim=0)
 
 
 def update_xk(x, r_nk, N_k):
     # Bishop eq 10.52; output shape = (K, D)
-    with tf.name_scope('update_xk'):
-        x_k = tf.einsum('nk,nd->kd', r_nk, x)
-        x_k_normed = tf.divide(x_k, tf.expand_dims(N_k, axis=1))
-        # remove nan values (if N_k == 0)
-        return tf.where(tf.is_nan(x_k_normed), x_k, x_k_normed, name='xk_new')
+    
+    x_k = torch.einsum('nk,nd->kd', r_nk, x)
+    x_k_normed = torch.divide(x_k, N_k.unsqueeze(1))
+    # remove nan values (if N_k == 0)
+    return torch.where(torch.isnan(x_k_normed), x_k, x_k_normed)
 
 
 def update_Sk(x, r_nk, N_k, x_k):
     # Bishop eq 10.53
-    with tf.name_scope('update_S_k'):
-        x_xk = tf.expand_dims(x, axis=1) - tf.expand_dims(x_k, axis=0)
-        S = tf.einsum('nk,nkde->kde', r_nk, tf.einsum('nkd,nke->nkde', x_xk, x_xk))
-        S_normed = tf.divide(S, tf.expand_dims(tf.expand_dims(N_k, axis=1), axis=2))
-        # remove nan values (if N_k == 0)
-        return tf.where(tf.is_nan(S_normed), S, S_normed, name='S_new')
+    
+    x_xk = x.unsqueeze(1) - x_k.unsqueeze(0)
+    S = torch.einsum('nk,nkde->kde', r_nk, torch.einsum('nkd,nke->nkde', x_xk, x_xk))
+    S_normed = torch.divide(S, N_k.unsqueeze(1).unsqueeze(2))
+    # remove nan values (if N_k == 0)
+    return torch.where(torch.isnan(S_normed), S, S_normed)
 
 
 def update_alphak(alpha_0, N_k):
     # Bishop eq 10.58
-    return tf.add(alpha_0, N_k, name='new_alphak')
+    return torch.add(alpha_0, N_k)
 
 
 def update_betak(beta_0, N_k):
     # Bishop eq 10.60
-    return tf.add(beta_0, N_k, name='new_betak')
+    return torch.add(beta_0, N_k,)
 
-
+##### Start here again
 def update_mk(beta_0, m_0, N_k, x_k, beta_k):
     # Bishop eq 10.61
-    with tf.name_scope('update_m'):
-        if len(beta_0.get_shape()) == 1:
-            beta_0 = tf.reshape(beta_0, (-1, 1))
+   
+    if len(beta_0.shape) == 1:
+        beta_0 = torch.reshape(beta_0, (-1, 1))
 
-        Nk_xk = tf.multiply(tf.expand_dims(N_k, axis=1), x_k)
-        beta0_m0 = np.multiply(beta_0, m_0)
-        return tf.divide(beta0_m0 + Nk_xk, tf.expand_dims(beta_k, axis=1), name='m_new')
+    Nk_xk = torch.multiply(torch.expand_dims(N_k, axis=1), x_k)
+    beta0_m0 = np.multiply(beta_0, m_0)
+    return torch.divide(beta0_m0 + Nk_xk, beta_k.unsqueeze(1))
 
 
 def update_Ck(C_0, x_k, N_k, m_0, beta_0, beta_k, S_k):
     # Bishop eq 10.62
-    with tf.name_scope('update_C_k'):
-        C = C_0 + tf.multiply(tf.expand_dims(tf.expand_dims(N_k, axis=1), axis=2), S_k)
+    
+        C = C_0 + N_k.unsqueeze(1).unsqueeze(2)* S_k
         Q0 = x_k - m_0
-        q = tf.einsum('kd,ke->kde', Q0, Q0)
-        return tf.add(C, tf.einsum('k,kde->kde', np.divide(np.multiply(beta_0, N_k), beta_k), q), name='W_new')
+        q = torch.einsum('kd,ke->kde', Q0, Q0)
+        return torch.add(C, torch.einsum('k,kde->kde', np.divide(np.multiply(beta_0, N_k), beta_k), q))
 
 
 def update_vk(v_0, N_k):
     # Bishop eq 10.63
-    return tf.identity(v_0 + N_k + 1, name='vk_new')
+    return (v_0 + N_k + 1).clone()
 
 
 def compute_expct_mahalanobis_dist(x, beta_k, m_k, P_k, v_k):
     # Bishop eq 10.64
     # output shape: (N, K)
-    with tf.name_scope('compute_mhlnbs_dist'):
-        _, D = x.get_shape().as_list()
 
-        dist = tf.expand_dims(x, axis=1) - tf.expand_dims(m_k, axis=0)  # shape=(N, K, D)
-        m = tf.einsum('k,nk->nk', v_k,
-                      tf.einsum('nkd,nkd->nk', dist,
-                                tf.einsum('kde,nke->nkd', P_k, dist)))
-        return tf.add(m, tf.reshape(tf.divide(D, beta_k), (1, -1)), name='expct_mhlnbs_dist')   # shape=(1, K)
+    _, D = x.shape
 
+    dist = x.unsqueeze(1) - m_k.unsqueeze(0)  # shape=(N, K, D)
+    m = torch.einsum('k,nk->nk', v_k,
+                    torch.einsum('nkd,nkd->nk', dist,
+                            torch.einsum('kde,nke->nkd', P_k, dist)))
+    return torch.add(m, torch.reshape(torch.divide(D, beta_k), (1, -1)))   # shape=(1, K)
 
+'''
 def compute_dev_missing_data(x, beta_k, m_k, P_k, v_k, missing_data_mask):
     # Bishop eq 10.64; ignoring missing data
     # output shape: (N, K)
-    with tf.name_scope('compute_mean'):
+    
         _, D = x.get_shape()
 
-        d_beta = tf.reshape(tf.divide(int(D), beta_k), (1, -1))   # shape=(1, K)
-        x_mk = tf.expand_dims(x, axis=1) - tf.expand_dims(m_k, axis=0)  # shape=(N, K, D)
+        d_beta = torch.reshape(torch.divide(int(D), beta_k), (1, -1))   # shape=(1, K)
+        x_mk = x.unsqueeze(1) - m_k.unsqueeze(0)   # shape=(N, K, D)
 
         # exclude missing data: set 'missing' values to zero
         av_data_mask = tf.expand_dims(tf.to_float(tf.logical_not(missing_data_mask)), axis=1, name='available_data_mask')
@@ -113,42 +109,38 @@ def compute_dev_missing_data(x, beta_k, m_k, P_k, v_k, missing_data_mask):
 
         return tf.add(d_beta, m, name='lambda')
 
-
+'''
 def compute_expct_log_det_prec(v_k, P_k):
     # Bishop eq 10.65
-    with tf.name_scope('compute_expct_log_det_prec'):
-        det_P = tf.matrix_determinant(P_k)
-        log_det_P = tf.where(det_P > 1e-20, tf.log(det_P), tf.zeros_like(det_P, dtype=tf.float32))
-        # log_det_W = tf.log()  # shape=(5,)
+    
+        log_det_P = torch_utils.logdet(P_k)
 
-        K, D, _ = P_k.get_shape()
-        D = tf.constant(int(D), dtype=tf.float32)
-        D_log_2 = D * tf.log(tf.constant(2., dtype=tf.float32))
+        K, D, _ = P_k.shape
+        D_log_2 = float(D) * torch.log(2.)
 
-        i = tf.expand_dims(tf.range(D, dtype=tf.float32), axis=0)
-        sum_digamma = tf.reduce_sum(tf.digamma(0.5 * (tf.expand_dims(v_k, axis=1) + 1. + i)), axis=1)
+        i = torch.arange(D, dtype=torch.float32).unsqueeze(0)
+        sum_digamma = torch.sum(torch.digamma(0.5 * (v_k.unsqueeze(1) + 1. + i)), dim=1)
 
-        return tf.identity(sum_digamma + D_log_2 + log_det_P, name='log_det_prec')
+        return (sum_digamma + D_log_2 + log_det_P).clone()
 
 
 def compute_log_pi(alpha_k):
     # Bishop eq 10.66
-    with tf.name_scope('compute_log_pi'):
-        alpha_hat = tf.reduce_sum(alpha_k)
-        return tf.subtract(tf.digamma(alpha_k), tf.digamma(alpha_hat), name='log_pi')
+    
+    alpha_hat = torch.sum(alpha_k)
+    return torch.subtract(torch.digamma(alpha_k), torch.digamma(alpha_hat))
 
 
 def compute_rnk(expct_log_pi, expct_log_det_cov, expct_dev):
-    # Bishop eq 10.49
-    with tf.name_scope('compute_rnk'):
-        log_rho_nk = expct_log_pi + 0.5 * expct_log_det_cov - 0.5 * expct_dev
 
-        # for numerical stability: subtract largest log p(z=k) for each k
-        rho_nk_save = tf.exp(log_rho_nk - tf.reshape(tf.reduce_max(log_rho_nk, axis=1), (-1, 1)))
+    log_rho_nk = expct_log_pi + 0.5 * expct_log_det_cov - 0.5 * expct_dev
 
-        # normalize
-        rho_n_sum = tf.reduce_sum(rho_nk_save, axis=1)  # shape = (N,)
-        return tf.divide(rho_nk_save, tf.expand_dims(rho_n_sum, axis=1), name='r_nk')
+    # for numerical stability: subtract largest log p(z=k) for each k
+    rho_nk_save = torch.exp(log_rho_nk - torch.reshape(torch.max(log_rho_nk, dim=1), (-1, 1)))
+
+    # normalize
+    rho_n_sum = torch.sum(rho_nk_save, dim=1)  # shape = (N,)
+    return torch.divide(rho_nk_save, rho_n_sum.unsqueeze(1))
 
 
 def e_step(x, alpha_k, beta_k, m_k, P_k, v_k, name='e_step'):
@@ -165,15 +157,14 @@ def e_step(x, alpha_k, beta_k, m_k, P_k, v_k, name='e_step'):
     Returns:
         responsibilities and mixture coefficients
     """
-    with tf.name_scope(name):
-        expct_dev = compute_expct_mahalanobis_dist(x, beta_k, m_k, P_k, v_k)  # Bishop eq 10.64
-        expct_log_det_cov = compute_expct_log_det_prec(v_k, P_k)              # Bishop eq 10.65
-        expct_log_pi = compute_log_pi(alpha_k)                                # Bishop eq 10.66
-        r_nk = compute_rnk(expct_log_pi, expct_log_det_cov, expct_dev)        # Bishop eq 10.49
+    expct_dev = compute_expct_mahalanobis_dist(x, beta_k, m_k, P_k, v_k)  # Bishop eq 10.64
+    expct_log_det_cov = compute_expct_log_det_prec(v_k, P_k)              # Bishop eq 10.65
+    expct_log_pi = compute_log_pi(alpha_k)                                # Bishop eq 10.66
+    r_nk = compute_rnk(expct_log_pi, expct_log_det_cov, expct_dev)        # Bishop eq 10.49
 
-        return r_nk, tf.exp(expct_log_pi)
+    return r_nk, torch.exp(expct_log_pi)
 
-
+'''
 def e_step_missing_data(x, alpha_k, beta_k, m_k, P_k, v_k, missing_data_mask, name='e_step_imp'):
     """
     Variational E-update: update local parameters ignoring missing data.
@@ -196,9 +187,9 @@ def e_step_missing_data(x, alpha_k, beta_k, m_k, P_k, v_k, missing_data_mask, na
         r_nk = compute_rnk(expct_log_pi, expct_log_det_cov, expct_dev)
 
         return r_nk, tf.exp(expct_log_pi)
+'''
 
-
-def m_step(x, r_nk, alpha_0, beta_0, m_0, C_0, v_0, name='m_step'):
+def m_step(x, r_nk, alpha_0, beta_0, m_0, C_0, v_0):
     """
     Variational M-update: Update global parameters
     Args:
@@ -213,20 +204,20 @@ def m_step(x, r_nk, alpha_0, beta_0, m_0, C_0, v_0, name='m_step'):
     Returns:
         posterior parameters as well as data statistics
     """
-    with tf.name_scope(name):
-        N_k = update_Nk(r_nk)                                     # Bishop eq 10.51
-        x_k = update_xk(x, r_nk, N_k)                             # Bishop eq 10.52
-        S_k = update_Sk(x, r_nk, N_k, x_k)                        # Bishop eq 10.53
 
-        alpha_k = update_alphak(alpha_0, N_k)                     # Bishop eq 10.58
-        beta_k = update_betak(beta_0, N_k)                        # Bishop eq 10.60
-        m_k = update_mk(beta_0, m_0, N_k, x_k, beta_k)            # Bishop eq 10.61
-        C_k = update_Ck(C_0, x_k, N_k, m_0, beta_0, beta_k, S_k)  # Bishop eq 10.62
-        v_k = update_vk(v_0, N_k)                                 # Bishop eq 10.63
+    N_k = update_Nk(r_nk)                                     # Bishop eq 10.51
+    x_k = update_xk(x, r_nk, N_k)                             # Bishop eq 10.52
+    S_k = update_Sk(x, r_nk, N_k, x_k)                        # Bishop eq 10.53
 
-        return alpha_k, beta_k, m_k, C_k, v_k, x_k, S_k
+    alpha_k = update_alphak(alpha_0, N_k)                     # Bishop eq 10.58
+    beta_k = update_betak(beta_0, N_k)                        # Bishop eq 10.60
+    m_k = update_mk(beta_0, m_0, N_k, x_k, beta_k)            # Bishop eq 10.61
+    C_k = update_Ck(C_0, x_k, N_k, m_0, beta_0, beta_k, S_k)  # Bishop eq 10.62
+    v_k = update_vk(v_0, N_k)                                 # Bishop eq 10.63
 
+    return alpha_k, beta_k, m_k, C_k, v_k, x_k, S_k
 
+'''
 def inference(x, K, seed, name='inference'):
     """
 
@@ -267,7 +258,7 @@ def inference(x, K, seed, name='inference'):
             log_r_nk = tf.log(r_nk_new)
 
         return step, log_r_nk, theta, (x_k, S_k, pi)
-
+'''
 '''
 if __name__ == '__main__':
     path_dataset = '../datasets'

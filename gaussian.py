@@ -21,7 +21,7 @@ def natural_to_standard(eta1, eta2):
     mu = torch.reshape(mu, mu.shape)
     return mu, sigma
 
-def standard_to_natural(mu, sigma, name='gauss_to_nat'):
+def standard_to_natural(mu, sigma):
     """
     Args:
         mu: 10x6
