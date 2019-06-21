@@ -6,6 +6,9 @@ from visdom import Visdom
 from torchvision import datasets, transforms
 from torch import nn
 from torch_utils import exponential_learning_rate
+from torch.utils.tensorboard import SummaryWriter
+
+writer = SummaryWriter()
 
 
 parser = argparse.ArgumentParser(description='SVAE MNIST Example')
@@ -61,8 +64,10 @@ for epoch in range(args.epochs):
 
         for i, data, in enumerate(train_loader):
             batch_start_time = time.time()
+            #torch.onnx.export(model,data,"test.onnx")
             y_reconstruction, x_given_y_phi, x_k_samples, x_samples, log_z_given_y_phi, phi_gmm, phi_tilde = model(data)
-            elbo, details = model.compute_elbo(data, y_reconstruction, the_theta, phi_tilde, x_k_samples, log_z_given_y_phi, decoder_type)
+            elbo, _ = model.compute_elbo(data, y_reconstruction, the_theta, phi_tilde, x_k_samples, log_z_given_y_phi, decoder_type)
+            writer.add_graph(model,data[0])
             # Update GMM parameters
             if i == 0:
                 theta_star = model.m_step(gmm_prior=the_gmm_prior, x_samples=x_samples,
@@ -70,10 +75,11 @@ for epoch in range(args.epochs):
                 the_theta = model.update_gmm_params(the_theta, theta_star, lrcvi)
                 lrcvi = exponential_learning_rate(lrcvi, decay_rate, global_step, decay_steps)
             else:
-                theta_star = model.m_step(gmm_prior=the_theta, x_samples=x_samples,
-                                                        r_nk=torch.exp(log_z_given_y_phi))
-                the_theta = model.update_gmm_params(the_theta, theta_star, lrcvi)
-                lrcvi = exponential_learning_rate(lrcvi, decay_rate, global_step, decay_steps)
+                with torch.no_grad():
+                    theta_star = model.m_step(gmm_prior=the_theta, x_samples=x_samples,
+                                                            r_nk=torch.exp(log_z_given_y_phi))
+                    the_theta = model.update_gmm_params(the_theta, theta_star, lrcvi)
+                    lrcvi = exponential_learning_rate(lrcvi, decay_rate, global_step, decay_steps)
 
             if i % 100 == 0:
                 # keep some parameters for debugging
@@ -83,7 +89,8 @@ for epoch in range(args.epochs):
             # Optimize NN parameters
             elbo.backward()
             optim.step()
-            optim.zero_grad()
+            model.zero_grad()
+            
 
             
             #Check elbo:
@@ -97,7 +104,7 @@ for epoch in range(args.epochs):
             print("Finished 1st batch in {:.4f} seconds".format(batch_end_time-batch_start_time))
         
     except Exception as e:
-        
+        writer.close()
         print("Crashed")
         print(e)
 

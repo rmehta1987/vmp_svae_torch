@@ -9,6 +9,7 @@ import gmm
 import dirichlet
 import gaussian
 
+
 class GMMSVAE(nn.Module):
     def __init__(self, opts, encoderlayers, decoderlayers, input_dim=784):
         super(GMMSVAE, self).__init__()
@@ -142,10 +143,10 @@ class GMMSVAE(nn.Module):
     def forward(self, y):
 
         # Assume currently MINST data set, where first index is data, second is labels, and data is sorted as Size x Image_Row x Image_Col
-        assert list(y[0].shape[2:]) == [28, 28], "The INPUT is not MNIST"
+        assert list(y.shape[2:]) == [28, 28], "The INPUT is not MNIST"
 
         # Use VAE encoder
-        x_given_y_phi = self.x_given_y_phi_model.forward(y[0].view(-1, 784).to(self.device))
+        x_given_y_phi = self.x_given_y_phi_model.forward(y.view(-1, 784).to(self.device))
         print ("Finished Encoder Forward pass at iteration {}".format(self.totiter))
 
         # execute E-step (update/sample local variables)
@@ -494,7 +495,7 @@ class GMMSVAE(nn.Module):
             sample_mean /= S
             loglik = -1/2 * sample_mean - M * L/2. * torch.log(2. * pi)
         
-        return loglik.clone()
+        return loglik
 
 
     def update_gmm_params(self, current_gmm_params, gmm_params_star, step_size):
