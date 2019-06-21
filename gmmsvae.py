@@ -1,23 +1,35 @@
 import numpy as np
 import torch
-import Decoder
-import Encoder
+from Decoder import Decoder
+from Encoder import Encoder
 from torch_utils import init_tensor_gpu_grad
 from torch import nn
+import niw
+import gmm
+import dirichlet
+import gaussian
 
 class GMMSVAE(nn.Module):
-    def __init__(self, opts, encoderlayers, decoderlayers):
+    def __init__(self, opts, encoderlayers, decoderlayers, input_dim=784):
+        super(GMMSVAE, self).__init__()
         self.device = opts.device
         self.encoder_layers = encoderlayers
         self.decoder_layers = decoderlayers
-        self.decoder_type = decoderslayers[-1][1]
+        self.decoder_type = decoderlayers[-1][1]
         self.nb_components = opts.nb_components
+        self.nb_samples = opts.nb_samples
         self.latent_dims = opts.latent_dims
-        self.seed = opt.seed
-        self.x_given_y_phi_model = Encoder(layerspecs=self.encoder_layers)
-        self.y_reconstruction_model = Decoder(layerspecs=self.decoder_layers)
+        self.seed = opts.seed
+        self.input_dim = input_dim
+        self.x_given_y_phi_model = Encoder(self.encoder_layers,input_dim)
+        self.y_reconstruction_model = Decoder(self.decoder_layers,self.latent_dims) # [type of layers, input_dim]
         self.gmm_prior, self.theta = self.init_mm(self.nb_components, self.latent_dims, self.seed, self.device)
-        self.phi_gmm = self.init_recognition_params(self.theta, self.nb_components, self.seed, self.device)
+        self.pi_k = torch.nn.Parameter(torch.randn((self.nb_components,),requires_grad=True).to(self.device))
+        self.train_mu_k, self.train_L_k, self.soft_pi_k = self.init_recognition_params(self.theta, self.nb_components, self.seed, self.device)
+        self.train_pi_k = self.soft_pi_k(self.pi_k)
+        #self.phi_gmm = (self.train_mu_k, self.train_L_k, self.train_pi_k)
+        self.totiter = 0
+
     
     '''
     def set_input(self, theinput):
@@ -41,7 +53,7 @@ class GMMSVAE(nn.Module):
        
         return elbo, details
     '''
-    def init_mm(nb_components, latent_dims, seed=0, param_device='cuda', theta_as_variable=True):
+    def init_mm(self, nb_components, latent_dims, seed=0, param_device='cuda', theta_as_variable=True):
         '''
         Args:
         Returns:
@@ -50,17 +62,17 @@ class GMMSVAE(nn.Module):
         '''
 
         # prior parameters area always constance so the don't take gradients for them
-        theta_prior = init_mm_params(nb_components, latent_dims, alpha_scale=0.05 / nb_components, beta_scale=0.5, 
-                                    m_scale=0, C_scale=latent_dims + 0.5, v_init=latent_dims + 0.5,seed=seed,
+        theta_prior = self.init_mm_params(nb_components, latent_dims, alpha_scale=0.05 / nb_components, beta_scale=0.5, 
+                                    m_scale=0, C_scale=latent_dims + 0.5, v_init=latent_dims + 0.5,seed=0,
                                     as_variables=False, trainable=False, device=param_device)
 
-        theta = init_mm_params(nb_components, latent_dims, alpha_scale=1., beta_scale=1., m_scale=5.,
-                                C_scale=2 * (latent_dims), v_init=latent_dims + 1., seed=seed,
+        theta = self.init_mm_params(nb_components, latent_dims, alpha_scale=1., beta_scale=1., m_scale=5.,
+                                C_scale=2 * (latent_dims), v_init=latent_dims + 1., seed=0,
                                 as_variables=theta_as_variable, trainable=False)
         
         return theta_prior, theta
 
-    def init_mm_params(nb_components, latent_dims, alpha_scale=.1, beta_scale=1e-5, v_init=10., m_scale=1., C_scale=10.,
+    def init_mm_params(self, nb_components, latent_dims, alpha_scale=.1, beta_scale=1e-5, v_init=10., m_scale=1., C_scale=10.,
                     seed=0, as_variables=True, trainable=False, device='cuda'):
         
         alpha_init = alpha_scale * torch.ones(nb_components,) # shape [nb_components]
@@ -82,7 +94,7 @@ class GMMSVAE(nn.Module):
         return alpha, A, b, beta, v_hat
 
 
-    def init_recognition_params(theta, nb_components, seed=0, param_device='cuda'):
+    def init_recognition_params(self, theta, nb_components, seed=0, param_device='cuda'):
         '''
         Args:
             theta [is a tuple that contains the following parameters]:
@@ -95,16 +107,15 @@ class GMMSVAE(nn.Module):
         '''
         # make parameters for PGM part of recognition network
                 
-        mu_k, L_k = make_loc_scale_variables(theta, param_device)
-        pi_k_softmax = torch.nn.Softmax().cuda()
-        pi_k = pi_k_softmax(torch.randn((nb_components,)).to(param_device))
-
-        
-
-        return mu_k, L_k, pi_k
+        mu_k, L_k = self.make_loc_scale_variables(theta, param_device)
+        pi_k_softmax = torch.nn.Softmax(dim=0).cuda()
+        #pi_k = pi_k_softmax(torch.randn((nb_components,)).to(param_device)) # does not go into module.parameters()
 
 
-    def make_loc_scale_variables(theta, param_device):
+        return mu_k, L_k, pi_k_softmax
+
+
+    def make_loc_scale_variables(self, theta, param_device):
         
         '''
         Args:
@@ -127,24 +138,27 @@ class GMMSVAE(nn.Module):
         return mu_k, L_k
 
 
-    def forward(self, y, phi_gmm, encoder_layers, decoder_layers, nb_samples=10, stddev_init_nn=0.01, seed=0):
+    #def forward(self, y, phi_gmm, encoder_layers, decoder_layers, nb_samples=10, stddev_init_nn=0.01, seed=0):
+    def forward(self, y):
 
         # Assume currently MINST data set, where first index is data, second is labels, and data is sorted as Size x Image_Row x Image_Col
-        assert list(y[0].shape[1:]) == [28, 28], "The INPUT is not MNIST"
+        assert list(y[0].shape[2:]) == [28, 28], "The INPUT is not MNIST"
 
         # Use VAE encoder
-        x_given_y_phi = self.x_given_y_phi_model.forward(y[0].view(-1, 784))
+        x_given_y_phi = self.x_given_y_phi_model.forward(y[0].view(-1, 784).to(self.device))
+        print ("Finished Encoder Forward pass at iteration {}".format(self.totiter))
 
         # execute E-step (update/sample local variables)
-        x_k_samples, log_z_given_y_phi, phi_tilde, w_eta_12 = self.e_step(x_given_y_phi, phi_gmm, nb_samples, seed=seed)
-
+        x_k_samples, log_z_given_y_phi, phi_tilde, w_eta_12 = self.e_step(x_given_y_phi,  (self.train_mu_k, self.train_L_k, self.train_pi_k), self.nb_components, seed=0)
+        print ("Finished E-step Forward pass at iteration: {}".format(self.totiter))
         # compute reconstruction
         
         y_reconstruction = self.y_reconstruction_model.forward(x_k_samples)
+        print ("Finished Decoder Forward pass at iteration: {}".format(self.totiter))
+        #temp = torch.tensor(0,dtype=torch.int64)
+        x_samples = self.subsample_x(x_k_samples, log_z_given_y_phi, seed=0)[:, 0, :]
 
-        x_samples = self.subsample_x(x_k_samples, log_z_given_y_phi, seed)[:, 0, :]
-
-        return y_reconstruction, x_given_y_phi, x_k_samples, x_samples, log_z_given_y_phi, phi_gmm, phi_tilde
+        return y_reconstruction, x_given_y_phi, x_k_samples, x_samples, log_z_given_y_phi,  (self.train_mu_k, self.train_L_k, self.train_pi_k), phi_tilde
 
 
     def e_step(self, phi_enc, phi_gmm, nb_samples, seed=0):
@@ -180,7 +194,7 @@ class GMMSVAE(nn.Module):
         eta2_phi_tilde = eta2_phi1.unsqueeze(1) + eta2_phi2.unsqueeze(0) 
         eta1_phi_tilde = (eta1_phi1.unsqueeze(1) + eta1_phi2.unsqueeze(0)).unsqueeze(-1) # without inv(eta2_phi_tilde)
 
-        x_k_samples = self.sample_x_per_comp(eta1_phi_tilde,eta2_phi_tilde,nb_samples,seed)
+        x_k_samples = self.sample_x_per_comp(eta1_phi_tilde,eta2_phi_tilde,nb_samples,seed=0)
 
         return x_k_samples, log_z_given_y_phi, (eta1_phi_tilde, eta2_phi_tilde), dbg
 
@@ -198,27 +212,27 @@ class GMMSVAE(nn.Module):
         """
 
         inv_sigma = -2. * eta2  # For reason see e_step calculation of eta1_phi_tilde
-        N, K, _, D = eta2.get_shape()
+        N, K, _, D = eta2.shape
 
         # cholesky decomposition and adding noise (raw_noise is of dimension (DxB), where B is the size of MC samples)
         # Note cholesky decomposition that the lower triangle can be interperted as the square root of the matrix
         L = torch.cholesky(inv_sigma) # sigma = sqrt(variance)
         sample_shape = (int(N), int(K), int(D), nb_samples)
-        raw_noise = torch.randn(sample_shape)
-        noise = L.t().inverse()@raw_noise
+        raw_noise = torch.randn(sample_shape).cuda()
+        noise = L.transpose(dim0=3,dim1=2).inverse()@raw_noise
 
         # reparam-trick-sampling: x_samps = mu_tilde + noise: shape = N, K, S, D (permute = N-dim transpose)
-        x_k_samps = (inv_sigma.inverse()@eta1 + noise).permute(3,2,1,0)
+        x_k_samps = (inv_sigma.inverse()@eta1 + noise).permute(0,1,3,2)
 
         return x_k_samps
         
 
-    def subsample_x(x_k_samples, log_q_z_given_y, seed=0):
+    def subsample_x(self, x_k_samples, log_q_z_given_y, seed=0):
         """
         Given S samples for each of the K components for N datapoints (x_k_samples) and q(z_n=k|y), subsample S samples for
         each data point
         Args:
-            x_k_samples: sample matrix of shape (N, K, S, L)
+            x_k_samples: sample matrix of shape (N, K, S, L) 
             log_q_z_given_y: probability q(z_n=k|y_n, phi) [Shape: N x K]
             seed: random seed
         Returns:
@@ -228,23 +242,33 @@ class GMMSVAE(nn.Module):
         N, K, S, L = x_k_samples.shape
 
         # prepare indices for N and S dimension
-        n_idx = torch.arange(start=0,end=N).unsqueeze(1).repeat(1,S)
-        s_idx = torch.arange(start=0,end=S).unsqueeze(0).repeat(N,1)
+        n_idx = torch.arange(start=0,end=N).unsqueeze(1).repeat(1,S)  # S samples for each observation N, n_idx[0] = len([0,0,0,...,0]) = S
+        s_idx = torch.arange(start=0,end=S).unsqueeze(0).repeat(N,1)  # N Each observation has S samples, s_idx[0] = [0,1,2,...,S] -- N Times 
 
-        z_samps = torch.multinomial(log_q_z_given_y,S)
+        z_samps = torch.multinomial(torch.exp(log_q_z_given_y),S)
         
         # Make sure all indexes are ints
-        z_samps = z_samps.to(torch.int32)
+        z_samps = z_samps.to(torch.int64)
 
         # tensor of shape (N, S, 3), containing indices of all chosen samples
         # choices = torch.cat((n_idx.unsqueeze(2),z_samps.unsqueeze(2),s_idx.unsqueeze(2)),dim=2) --- DON'T NEED TO DO IN PYTORCH
 
         # select the chosen samples from x_k_samples, choices are the indices needed to extract from x_k_samples
+        # So to paraphrase again, we have K components (from the GMM model) and S samples of each component, where each sample represents the parameters
+        # of the latent dimensions, and what we want is S samples for each unique observation in the batch (N) such that the resulting matrix has
+        # S samples of N observations
+
+        # For example if we have a minibatch of 64, N = 64, GMM clusters of 10, K = 10, 10 Samples for every cluster, S = 10, and 3 Latent Dims from NN, then L = 6
+        # So we have x_k_samples = [64, 10, 10, 6]  then n_idx represents getting S samples for observation, and s_idx represents which sample to get from the K-the component
+        # the Kth-Component is chosen from z_samps, such that z_samps will have a length of S, so if z_samps = [9, 9, 9, 2, 9, 9, 9, 9, 8, 2], we will have 
+        # 7 samples from the 9th component, 2 samples from the 2nd component, and 1 sample from the 8th component
+
         # Replaced tf.gather_nd in tensorflow (from original code) with pytorch's advance indexing
-        return x_k_samples[n_idx,z_samps,s_idx]
+   
+        return x_k_samples[[n_idx,z_samps,s_idx]]
 
 
-    def unpack_recognition_gmm(phi_gmm):
+    def unpack_recognition_gmm(self, phi_gmm):
         """
         
         Args:
@@ -261,7 +285,7 @@ class GMMSVAE(nn.Module):
         # Computer Precision - the inverted Variance (1/sigma^2)
         # Make sure L_k_raw is a valid Cholesky decomposition A = LL*, where L is lower triangle
         # L* is conjugate tranpose of L 
-        L_k = torch.tril(L_K_raw) # Returns batch of lower triangular part of matrix
+        L_k = torch.tril(L_k_raw) # Returns batch of lower triangular part of matrix
 
         # Get diagonals of lower triangular (Note for batch inputs need to do :To take a batch diagonal, pass in dim1=-2, dim2=-1)
         # see https://pytorch.org/docs/stable/torch.html#torch.diagonal
@@ -273,18 +297,19 @@ class GMMSVAE(nn.Module):
         mask = torch.diag_embed(torch.ones_like(softplus_L_k)) 
         L_k = torch.diag_embed(softplus_L_k) + (1. - mask)*L_k # * is overloaded in pytorch for elemente wise multiplication
 
-        # Compute Precision [Note @ = matmul]
-        the_Precision = L_k @ torch.transpose(L_k,1,2) #dim's 1 and 2 are the cluster parameters, dim 0 are the actual clusters
+        # Compute Precision [Note @ = matmul]  
+        the_Precision = L_k @ torch.transpose(L_k,2,1) #dim's 1 and 2 are the cluster parameters, dim 0 are the actual clusters
 
         # Compute natural parameter of precision 
         eta2 = -0.5*the_Precision
 
         # make sure that log_pi_k are valid mixture coefficients, softmax normalizes pi_k such that sum(pi_k)=1
-        pi_k = torch.nn.softmax(pi_k_raw) 
+        m = torch.nn.Softmax() 
+        pi_k = m(pi_k_raw)
 
         return (eta1, eta2, pi_k)
 
-    def compute_log_z_given_y(eta1_phi1, eta2_phi1, eta1_phi2, eta2_phi2, pi_phi2):
+    def compute_log_z_given_y(self, eta1_phi1, eta2_phi1, eta1_phi2, eta2_phi2, pi_phi2):
         """
 
         Args:
@@ -299,10 +324,10 @@ class GMMSVAE(nn.Module):
         """
 
         N, L = eta1_phi1.shape # mean * precision
-        assert eta2_phi1.shape == (N, L, L)
+        assert list(eta2_phi1.shape) == [N, L, L]
         K, L2 = eta1_phi2.shape # mean * precision
         assert L2 == L
-        assert eta2_phi2.shape == (K, L, L) # 1/precision
+        assert list(eta2_phi2.shape) == [K, L, L] # 1/precision
 
         # Get Natural Parameters of Gaussian -- again see: http://www.robots.ox.ac.uk/~cvrg/michaelmas2004/VariationalInferenceAndVMP.pdf (slide 31)
         # eta2 = precision * -0.5
@@ -320,29 +345,29 @@ class GMMSVAE(nn.Module):
         # output is now mini_batch x num_components x latent_dim x latent_dim
         eta2_phi_tilde = torch.unsqueeze(eta2_phi1,1)+torch.unsqueeze(eta2_phi2,0)
 
-        # calculate eta2_2 / inverse(eta2_2 + eta2_1) = inverse(eta2_2+eta2_1) * eta2_2
+        # calculate eta2_2 / inverse(eta2_2 + eta2_1) = inverse(eta2_2+eta2_1) * eta2_2 [shape:  mini_batch x num_components x latent_dim x latent_dim]
         inv_eta2_eta2_sum_eta1 = eta2_phi_tilde.inverse() @ eta2_phi2.expand(N,-1,-1,-1)
 
-        # calculate eta2_1 * inv_sum_eta2_eta1
+        # calculate eta2_1 * inv_sum_eta2_eta1 [shape:  mini_batch x num_components x latent_dim x latent_dim]
         w_eta2 = torch.einsum('nju,nkui->nkij', eta2_phi1, inv_eta2_eta2_sum_eta1)
 
         # now calculate the mean natural parameter [mean * precision]
         # remember precision is inv[sigma_phi1+sigma+phi2]
 
         # calculate [mu*precision_2] * (1 / eta2_2 + eta2_1)  --- Note eta1_phi2 = mu*precision_2 or mu/sigma_phi2
-        mu_eta2_1_eta2_2 = eta2_phi_tilde.inverse() @ eta1_phi1.unsqueeze(0).unsqueeze(-1).expand(N,-1,-1,1) # Shape: NxKxLx1
+        mu_eta2_1_eta2_2 = eta2_phi_tilde.inverse() @ eta1_phi2.unsqueeze(0).unsqueeze(-1).expand(N,-1,-1,1) # Shape: NxKxLx1
 
         #Calculate eta2_1 * mu_eta2_1_eta2_2 = [mu*eta2_1*eta2_2]/(eta2_1+eta2_2)
         w_eta1 = torch.einsum('nuj,nkuv->nkj',eta2_phi1,mu_eta2_1_eta2_2) # Shape: NxKxL
 
-        # computer means
+        # compute means
         mu_phi1, _ = gaussian.natural_to_standard(eta1_phi1, eta2_phi1)  # Remember the observed data are the means of recognition network (encoder output)
 
         # computer log_z_given_y_phi
         return gaussian.log_probability_nat(mu_phi1, w_eta1, w_eta2, pi_phi2), (w_eta1, w_eta2)
 
 
-    def compute_elbo(y, reconstructions, theta, phi_tilde, x_k_samps, log_z_given_y_phi, decoder_type):
+    def compute_elbo(self, y, reconstructions, theta, phi_tilde, x_k_samps, log_z_given_y_phi, decoder_type):
         """
         Compute ELBO of Latent GMM 
         Args:
@@ -364,20 +389,20 @@ class GMMSVAE(nn.Module):
         beta_k, m_k, C_k, v_k = niw.natural_to_standard(*theta[1:])
         mu, sigma = niw.expected_values((beta_k, m_k, C_k, v_k))
         eta1_theta, eta2_theta = gaussian.standard_to_natural(mu, sigma)
-        alpha_k = dirichlet.natural_to_standard(eta[0])
+        alpha_k = dirichlet.natural_to_standard(theta[0])
         expected_log_pi_theta = dirichlet.expected_log_pi(alpha_k)
 
         # Don't backprop through GMM
-        eta1_theta.requires_grad = False
-        eta2_theta.requires_grad = False
-        expected_log_pi_theta.requires_grad = False
+        eta1_theta = eta1_theta.detach()  
+        eta2_theta = eta2_theta.detach()
+        expected_log_pi_theta = expected_log_pi_theta.detach()
 
         r_nk = torch.exp(log_z_given_y_phi)
 
         # compute negative reconstruction error; sum over minibatch (use VAE function)
         means_recon, out_2_recon = reconstructions # out_2 is gaussian variances 
         if decoder_type == 'standard':
-            self.neg_reconstruction_error = expected_diagonal_gaussian_loglike(y[0].view(-1, 784), means_recon, out_2_recon, weights=r_nk)
+            self.neg_reconstruction_error = self.expected_diagonal_gaussian_loglike(y[0].view(-1, 784).to(self.device), means_recon, out_2_recon, weights=r_nk)
         else:
             raise NotImplementedError
         
@@ -405,7 +430,7 @@ class GMMSVAE(nn.Module):
         log_N_x_given_phi = gaussian.log_probability_nat_per_samp(x_k_samps, eta1_phi_tilde, eta2_phi_tilde)  # Shape: N x K x L  
         log_numerator = log_N_x_given_phi + log_z_given_y_phi.unsqueeze(2)  # Since q(z|y,phi) is only of shape N x K
 
-        log_N_x_given_theta = gaussian.log_probability_nat_per_samp(x_k_samps, eta1_theta.expand(N,-1,-1), eta2_theta.expand(N,-1,-1,-1,-1)) # Shape: N x K x L
+        log_N_x_given_theta = gaussian.log_probability_nat_per_samp(x_k_samps, eta1_theta.unsqueeze(0).expand(N,-1,-1), eta2_theta.expand(N,-1,-1,-1)) # Shape: N x K x L
         log_denominator = log_N_x_given_theta + expected_log_pi_theta.unsqueeze(0).unsqueeze(2)
 
         regualizer_term_part_1 = r_nk.unsqueeze(2) * (log_numerator - log_denominator)
@@ -413,14 +438,14 @@ class GMMSVAE(nn.Module):
         regualizer_term_part_3 = torch.sum(regualizer_term_part_2,dim=0)
         self.regualizer_term_final = torch.mean(regualizer_term_part_3)
 
-        elbo = neg_reconstruction_error - regualizer_term_final
+        elbo = -1. * (self.neg_reconstruction_error - self.regualizer_term_final)
 
-        details = (neg_reconstruction_error, torch.sum(r_nk*torch.mean(log_numerator,-1)),torch.sum(r_nk*torch.mean(log_denominator,-1)), regualizer_term_final)
+        details = (self.neg_reconstruction_error, torch.sum(r_nk*torch.mean(log_numerator,-1)),torch.sum(r_nk*torch.mean(log_denominator,-1)), self.regualizer_term_final)
 
         return elbo, details
 
 
-    def expected_diagonal_gaussian_loglike(y, param1_recon, param2_recon, weights=None):
+    def expected_diagonal_gaussian_loglike(self, y, param1_recon, param2_recon, weights=None):
         """
         computes expected diagonal log-likelihood SUM_{n=1} E_{q(z)}[log N(x_n|mu(z), sigma(z))]
         Args:
@@ -439,7 +464,7 @@ class GMMSVAE(nn.Module):
             param1_recon = param1_recon if len(param1_recon.shape) == 3 else param1_recon.unsqueeze(1)
             param2_recon = param2_recon if len(param2_recon.shape) == 3 else param2_recon.unsqueeze(1)
             M, S, L = param1_recon.shape
-            assert y.shape == (M, L)
+            assert list(y.shape) == [M, L]
 
             sample_mean = torch.sum(torch.pow(y.unsqueeze(1) - param1_recon, 2) / param2_recon) + torch.sum(torch.log(param2_recon))
 
@@ -454,17 +479,17 @@ class GMMSVAE(nn.Module):
         else:
             M, K, S, L = param1_recon.shape
             assert param2_recon.shape == param1_recon.shape
-            assert weights.shape == (M, K)
+            assert list(weights.shape) == [M, K]
 
             # adjust y's shape (add component and sample dimensions)
             y = y.unsqueeze(1).unsqueeze(1)
 
-            sample_mean = torch.einsum('nksd,nk->', torch.square(y - param1_recon)/ param2_recon + torch.log(param2_recon + 1e-8), weights)
+            sample_mean = torch.einsum('nksd,nk->', torch.pow(y - param1_recon,2)/ param2_recon + torch.log(param2_recon + 1e-8), weights)
 
-            S = torch.tensor(int(S), dtype=torch.float32, requires_grad = False)
-            M = torch.tensor(int(M), dtype=torch.float32, requires_grad = False)
-            L = torch.tensor(int(L), dtype=torch.float32, requires_grad = False)
-            pi = torch.tensor(np.pi, dtype=torch.float32, requires_grad = False)
+            S = torch.tensor(int(S), dtype=torch.float32, requires_grad = False).cuda()
+            M = torch.tensor(int(M), dtype=torch.float32, requires_grad = False).cuda()
+            L = torch.tensor(int(L), dtype=torch.float32, requires_grad = False).cuda()
+            pi = torch.tensor(np.pi, dtype=torch.float32, requires_grad = False).cuda()
 
             sample_mean /= S
             loglik = -1/2 * sample_mean - M * L/2. * torch.log(2. * pi)
@@ -472,7 +497,7 @@ class GMMSVAE(nn.Module):
         return loglik.clone()
 
 
-    def update_gmm_params(current_gmm_params, gmm_params_star, step_size):
+    def update_gmm_params(self, current_gmm_params, gmm_params_star, step_size):
         """
         Computes convex combination between current and updated parameters.
         Args:
@@ -483,14 +508,14 @@ class GMMSVAE(nn.Module):
 
         Returns:
         """
+        a, b, c, d, e = current_gmm_params
 
-        for i, (curr_param, param_star) in enumerate(zip(current_gmm_params, gmm_params_star)):
-            current_gmm_params[i] = (1 - step_size)*curr_param + step_size * param_star
-
+        current_gmm_params = [(1 - step_size)*curr_param + step_size * param_star for (curr_param, param_star) in zip(current_gmm_params, gmm_params_star)]
+  
         return current_gmm_params
 
 
-    def predict(y, phi_gmm, encoder_layers, decoder_layers, seed=0):
+    def predict(self, y, phi_gmm, encoder_layers, decoder_layers, seed=0):
         """
         Args:
             y: data to cluster and reconstruct
@@ -507,7 +532,7 @@ class GMMSVAE(nn.Module):
         phi_enc_model = Encoder(layerspecs=encoder_layers)
         phi_enc = phi_enc_model.forward(y)
 
-        x_k_samples, log_r_nk, _, _ = e_step(phi_enc, phi_gmm, nb_samples, seed=seed)
+        x_k_samples, log_r_nk, _, _ = e_step(phi_enc, phi_gmm, nb_samples, seed=0)
         x_samples = subsample_x(x_k_samples, log_r_nk, seed)[:, 0, :]
 
         y_recon_model = Decoder(layerspecs=decoder_layers)
@@ -516,7 +541,7 @@ class GMMSVAE(nn.Module):
         return (y_mean, torch.argmax(log_r_nk,dim=1))
 
 
-    def m_step(gmm_prior, x_samples, r_nk):
+    def m_step(self, gmm_prior, x_samples, r_nk):
         """
         Args:
             gmm_prior: Dirichlet+NiW prior for Gaussian mixture model

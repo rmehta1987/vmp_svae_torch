@@ -3,6 +3,8 @@ from __future__ import division
 from __future__ import print_function
 
 import torch
+import numpy as np
+
 
 def logdet(A):
 
@@ -20,12 +22,21 @@ def logdet(A):
     Returns:
         log(det(A))
     """
-
-    return 2. * torch.sum(torch.log(torch.diagonal(torch.cholesky(A), dim1=-2, dim2=-1)), axis=-1)
+    theval = 2. * torch.sum(torch.log(torch.diagonal(torch.cholesky(A), dim1=-2, dim2=-1)), dim=-1)
+    return theval
 
 
 def init_tensor_gpu_grad(org_tensor, trainable=True, device='cuda'):
 
-    new_tensor = nn.Parameter(org_tensor.to(device))
-    
+    if trainable:
+        new_tensor = torch.nn.Parameter(org_tensor.to(device))
+    else:
+        new_tensor = org_tensor.to(device)
     return new_tensor
+
+
+def exponential_learning_rate(learning_rate, decay_rate, global_step, decay_steps):
+
+    # https://www.tensorflow.org/api_docs/python/tf/train/exponential_decay
+
+    return torch.tensor(learning_rate*np.power(decay_rate,global_step/decay_steps)).cuda()
