@@ -25,35 +25,14 @@ class GMMSVAE(nn.Module):
         self.x_given_y_phi_model = Encoder(self.encoder_layers,input_dim)
         self.y_reconstruction_model = Decoder(self.decoder_layers,self.latent_dims) # [type of layers, input_dim]
         self.gmm_prior, self.theta = self.init_mm(self.nb_components, self.latent_dims, self.seed, self.device)
-        self.pi_k = torch.nn.Parameter(torch.randn((self.nb_components,),requires_grad=True).to(self.device))
+        #self.pi_k = torch.nn.Parameter(torch.randn((self.nb_components,),requires_grad=True).to(self.device))
+        self.pi_k = torch.randn((self.nb_components,),requires_grad=False).to(self.device)
         self.train_mu_k, self.train_L_k, self.soft_pi_k = self.init_recognition_params(self.theta, self.nb_components, self.seed, self.device)
         self.train_pi_k = self.soft_pi_k(self.pi_k)
         #self.phi_gmm = (self.train_mu_k, self.train_L_k, self.train_pi_k)
         self.totiter = 0
 
     
-    '''
-    def set_input(self, theinput):
-
-        # Assume currently MINST data set, where first index is data, second is labels, and data is sorted as Size x Image_Row x Image_Col
-        assert list(theinput[0].shape[1:]) = [28,28], "The INPUT is not MNIST"
-
-        self.input = theinput[0].view(-1, 784)
-
-    
-    def optimize_parameters(self):
-
-        
-        y_reconstruction, x_given_y_phi, x_k_samples, x_samples, 
-        log_z_given_y_phi, phi_gmm, phi_tilde = self.forward(self.input, self.phi_gmm, 
-                                                        self.encoder_layers, self.decoder_layers, param_device=self.device)
-        
-        elbo, details = self.compute_elbo(self.input, y_reconstruction, self.theta, phi_tilde,
-                                                                  x_k_samples, log_z_given_y_phi,
-                                                                  decoder_type=self.decoder_type)
-       
-        return elbo, details
-    '''
     def init_mm(self, nb_components, latent_dims, seed=0, param_device='cuda', theta_as_variable=True):
         '''
         Args:
@@ -133,8 +112,13 @@ class GMMSVAE(nn.Module):
         mu_k_init, sigma_k = niw.expected_values(theta_copied)
         L_k_init = torch.cholesky(sigma_k)
 
-        mu_k = init_tensor_gpu_grad(mu_k_init,trainable=True,device=param_device)
-        L_k = init_tensor_gpu_grad(L_k_init,trainable=True,device=param_device)
+        # mu_k = init_tensor_gpu_grad(mu_k_init,trainable=True,device=param_device)
+        # L_k = init_tensor_gpu_grad(L_k_init,trainable=True,device=param_device)
+
+        # For debugging seeing if this is causing the backwards problem:
+        mu_k = init_tensor_gpu_grad(mu_k_init,trainable=False,device=param_device)
+        L_k = init_tensor_gpu_grad(L_k_init,trainable=False,device=param_device)
+
 
         return mu_k, L_k
 
@@ -143,7 +127,7 @@ class GMMSVAE(nn.Module):
     def forward(self, y):
 
         # Assume currently MINST data set, where first index is data, second is labels, and data is sorted as Size x Image_Row x Image_Col
-        assert list(y.shape[2:]) == [28, 28], "The INPUT is not MNIST"
+        assert list(y.shape[-2:]) == [28, 28], "The INPUT is not MNIST"
 
         # Use VAE encoder
         x_given_y_phi = self.x_given_y_phi_model.forward(y.view(-1, 784).to(self.device))
@@ -403,7 +387,7 @@ class GMMSVAE(nn.Module):
         # compute negative reconstruction error; sum over minibatch (use VAE function)
         means_recon, out_2_recon = reconstructions # out_2 is gaussian variances 
         if decoder_type == 'standard':
-            self.neg_reconstruction_error = self.expected_diagonal_gaussian_loglike(y[0].view(-1, 784).to(self.device), means_recon, out_2_recon, weights=r_nk)
+            self.neg_reconstruction_error = self.expected_diagonal_gaussian_loglike(y.view(-1, 784).to(self.device), means_recon, out_2_recon, weights=r_nk)
         else:
             raise NotImplementedError
         
@@ -444,6 +428,39 @@ class GMMSVAE(nn.Module):
         details = (self.neg_reconstruction_error, torch.sum(r_nk*torch.mean(log_numerator,-1)),torch.sum(r_nk*torch.mean(log_denominator,-1)), self.regualizer_term_final)
 
         return elbo, details
+    
+    def compute_elbo_debug(self, y, reconstructions, theta, phi_tilde, x_k_samps, log_z_given_y_phi, decoder_type):
+        """
+        Compute Reconstruction Error  -- For debugging purposes
+        Args:
+            y: original data
+            reconstructions: reconststructed y
+            theta: hyperparameters of GMM model 
+                [alpha: prior Dirichlet parameters, beta/kappa: prior NiW, 
+                controls variance of mean, m: prior of mean, c: prior of covariance, v: prior degrees of freedom ]
+            phi_tilde: Natural Parameters of GMM
+            x_k_samps: Latent Vectors produced from GMM
+            log_z_given_y_phi: Mixture probabilities # Shape: N x K 
+            decoder_type: Gaussian or Bernoulli decoder
+
+        Returns:
+            ELBO: evidence lower bound of reconstruction and KL divergence of prior and variational prior
+            Details: Tuple of negative reconstruction error, numberator of regularizer, denominator of regulaizer, regualizer term
+        """
+
+        # Don't backprop through GMM
+        r_nk = torch.exp(log_z_given_y_phi)
+
+        # compute negative reconstruction error; sum over minibatch (use VAE function)
+        means_recon, out_2_recon = reconstructions # out_2 is gaussian variances 
+        if decoder_type == 'standard':
+            self.neg_reconstruction_error = self.expected_diagonal_gaussian_loglike(y.view(-1, 784).to(self.device), means_recon, out_2_recon, weights=r_nk)
+        else:
+            raise NotImplementedError
+
+        elbo = -1. * (self.neg_reconstruction_error)
+
+        return elbo
 
 
     def expected_diagonal_gaussian_loglike(self, y, param1_recon, param2_recon, weights=None):
