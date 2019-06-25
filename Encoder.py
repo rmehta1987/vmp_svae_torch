@@ -43,9 +43,9 @@ class Encoder(nn.Module):
         self.b2 = init_tensor_gpu_grad(torch.zeros(self.output_dim),trainable=True, device='cuda')
         
         if self.the_type == 'standard':
-            self.a = torch.tensor(1., dtype=torch.float32).to('cuda')
+            self.a = torch.tensor(1.).float().to('cuda')
         elif self.the_type == 'natparam':
-            self.a = torch.tensor(-0.5, dtype=torch.float32).to('cuda')
+            self.a = torch.tensor(-0.5).float().to('cuda')
         else:
             raise NotImplementedError
  

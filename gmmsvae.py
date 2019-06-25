@@ -26,7 +26,7 @@ class GMMSVAE(nn.Module):
         self.y_reconstruction_model = Decoder(self.decoder_layers,self.latent_dims) # [type of layers, input_dim]
         self.gmm_prior, self.theta = self.init_mm(self.nb_components, self.latent_dims, self.seed, self.device)
         #self.pi_k = torch.nn.Parameter(torch.randn((self.nb_components,),requires_grad=True).to(self.device))
-        self.pi_k = torch.randn((self.nb_components,),requires_grad=False).to(self.device)
+        self.pi_k = torch.randn((self.nb_components,),requires_grad=False).to(self.device) # see if this is causing backwards problem
         self.train_mu_k, self.train_L_k, self.soft_pi_k = self.init_recognition_params(self.theta, self.nb_components, self.seed, self.device)
         self.train_pi_k = self.soft_pi_k(self.pi_k)
         #self.phi_gmm = (self.train_mu_k, self.train_L_k, self.train_pi_k)
@@ -127,10 +127,11 @@ class GMMSVAE(nn.Module):
     def forward(self, y):
 
         # Assume currently MINST data set, where first index is data, second is labels, and data is sorted as Size x Image_Row x Image_Col
-        assert list(y.shape[-2:]) == [28, 28], "The INPUT is not MNIST"
+        # assert list(y.shape[-2:]) == [28, 28], "The INPUT is not MNIST"
 
         # Use VAE encoder
-        x_given_y_phi = self.x_given_y_phi_model.forward(y.view(-1, 784).to(self.device))
+        # x_given_y_phi = self.x_given_y_phi_model.forward(y.view(-1, 784).to(self.device))
+        x_given_y_phi = self.x_given_y_phi_model.forward(y.to(self.device))
         print ("Finished Encoder Forward pass at iteration {}".format(self.totiter))
 
         # execute E-step (update/sample local variables)
@@ -230,7 +231,11 @@ class GMMSVAE(nn.Module):
         n_idx = torch.arange(start=0,end=N).unsqueeze(1).repeat(1,S)  # S samples for each observation N, n_idx[0] = len([0,0,0,...,0]) = S
         s_idx = torch.arange(start=0,end=S).unsqueeze(0).repeat(N,1)  # N Each observation has S samples, s_idx[0] = [0,1,2,...,S] -- N Times 
 
-        z_samps = torch.multinomial(torch.exp(log_q_z_given_y),S)
+        tempvar = torch.exp(log_q_z_given_y.detach()).cpu()
+        temp = tempvar.sum(dim=1)
+        if (temp == 0).nonzero().nelement() != 0:
+            print ("TEST zamps")
+        z_samps = torch.multinomial(tempvar,S)
         
         # Make sure all indexes are ints
         z_samps = z_samps.to(torch.int64)
@@ -249,7 +254,7 @@ class GMMSVAE(nn.Module):
         # 7 samples from the 9th component, 2 samples from the 2nd component, and 1 sample from the 8th component
 
         # Replaced tf.gather_nd in tensorflow (from original code) with pytorch's advance indexing
-   
+        
         return x_k_samples[[n_idx,z_samps,s_idx]]
 
 
@@ -265,7 +270,9 @@ class GMMSVAE(nn.Module):
         
         """
 
-        eta1, L_k_raw, pi_k_raw = phi_gmm 
+        eta1, L_k_raw, pi_k_raw = phi_gmm
+        temp = pi_k_raw.cpu().numpy()
+        np.savetxt('test_1_{}.txt'.format(self.totiter),temp,fmt='%1.4e',delimiter=',')
 
         # Computer Precision - the inverted Variance (1/sigma^2)
         # Make sure L_k_raw is a valid Cholesky decomposition A = LL*, where L is lower triangle
@@ -275,7 +282,8 @@ class GMMSVAE(nn.Module):
         # Get diagonals of lower triangular (Note for batch inputs need to do :To take a batch diagonal, pass in dim1=-2, dim2=-1)
         # see https://pytorch.org/docs/stable/torch.html#torch.diagonal
         diag_L_k = torch.diagonal(L_k,dim1=-2,dim2=-1)
-        softplus_L_k = torch.nn.Softplus(diag_L_k).beta # Softplus function to make sure everything is positive-definite
+        m = torch.nn.Softplus() # Softplus function to make sure everything is positive-definite
+        softplus_L_k = m(diag_L_k)
 
         # Need to set diagonal of original Variance matrix to Softplus values, so use mask
         # see: https://stackoverflow.com/questions/49429147/replace-diagonal-elements-with-vector-in-pytorch/49431180#49431180
@@ -289,7 +297,7 @@ class GMMSVAE(nn.Module):
         eta2 = -0.5*the_Precision
 
         # make sure that log_pi_k are valid mixture coefficients, softmax normalizes pi_k such that sum(pi_k)=1
-        m = torch.nn.Softmax() 
+        m = torch.nn.Softmax(dim=0) 
         pi_k = m(pi_k_raw)
 
         return (eta1, eta2, pi_k)
@@ -328,8 +336,8 @@ class GMMSVAE(nn.Module):
 
         # combine eta2_phi1 and eta2_phi2 - eta2_phi1 has dimensions mini-batch samples x latent x latent and eta2_phi2 has dimensions num_components x latent dim x latent dim
         # output is now mini_batch x num_components x latent_dim x latent_dim
-        eta2_phi_tilde = torch.unsqueeze(eta2_phi1,1)+torch.unsqueeze(eta2_phi2,0)
-
+        eta2_phi_tilde = eta2_phi1.unsqueeze(1) + eta2_phi2.unsqueeze(0)
+        
         # calculate eta2_2 / inverse(eta2_2 + eta2_1) = inverse(eta2_2+eta2_1) * eta2_2 [shape:  mini_batch x num_components x latent_dim x latent_dim]
         inv_eta2_eta2_sum_eta1 = eta2_phi_tilde.inverse() @ eta2_phi2.expand(N,-1,-1,-1)
 
@@ -426,6 +434,7 @@ class GMMSVAE(nn.Module):
         elbo = -1. * (self.neg_reconstruction_error - self.regualizer_term_final)
 
         details = (self.neg_reconstruction_error, torch.sum(r_nk*torch.mean(log_numerator,-1)),torch.sum(r_nk*torch.mean(log_denominator,-1)), self.regualizer_term_final)
+        self.totiter += 1
 
         return elbo, details
     
@@ -454,11 +463,12 @@ class GMMSVAE(nn.Module):
         # compute negative reconstruction error; sum over minibatch (use VAE function)
         means_recon, out_2_recon = reconstructions # out_2 is gaussian variances 
         if decoder_type == 'standard':
-            self.neg_reconstruction_error = self.expected_diagonal_gaussian_loglike(y.view(-1, 784).to(self.device), means_recon, out_2_recon, weights=r_nk)
+            self.neg_reconstruction_error = self.expected_diagonal_gaussian_loglike(y.to(self.device), means_recon, out_2_recon, weights=r_nk)
         else:
             raise NotImplementedError
 
         elbo = -1. * (self.neg_reconstruction_error)
+        self.totiter += 1
 
         return elbo
 
@@ -527,6 +537,7 @@ class GMMSVAE(nn.Module):
         Returns:
         """
         a, b, c, d, e = current_gmm_params
+        step_size = torch.from_numpy(np.array(step_size)).cuda()
 
         current_gmm_params = [(1 - step_size)*curr_param + step_size * param_star for (curr_param, param_star) in zip(current_gmm_params, gmm_params_star)]
   
