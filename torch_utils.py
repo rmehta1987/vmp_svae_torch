@@ -43,7 +43,7 @@ def exponential_learning_rate(learning_rate, decay_rate, global_step, decay_step
     # or sourceTensor.clone().detach().requires_grad_(True), rather than torch.tensor(sourceTensor).
     # https://discuss.pytorch.org/t/clone-and-detach-in-v0-4-0/16861/2
     # remember to convert numpy value to numpy array
-    print ("Updating Learning Rate")
+    #print ("Updating Learning Rate")
     exp_learn = learning_rate*np.power(decay_rate, global_step/decay_steps)
     
     return exp_learn
@@ -67,3 +67,19 @@ def make_pinwheel_data(radial_std, tangential_std, num_classes, num_per_class, r
     data = np.random.permutation(np.hstack([feats, labels[:, None]]))
 
     return torch.tensor(data[:, 0:2]).float(), torch.tensor(data[:, 2], dtype=torch.int64)
+
+def rand_partial_isometry(input_dim, output_dim, stddev=1., seed=0):
+    """
+    Initialization as in MJJ's code (Johnson et. al. 2016)
+    Args:
+        m: rows
+        n: cols
+        stddev: standard deviation
+        seed: random seed
+
+    Returns:
+        matrix of shape (m, n) with orthonormal columns
+    """
+    d = max(input_dim, output_dim)
+    npr = np.random.RandomState(seed)
+    return np.linalg.qr(npr.normal(loc=0, scale=stddev, size=(d, d)))[0][:input_dim,:output_dim]
