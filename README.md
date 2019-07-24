@@ -1,7 +1,5 @@
 # vmp_svae_torch
-This is an implementation of Variational Message Passing for Structured VAE in pyTorch 
-
-Variational Message Passing for Structured VAE (Code for the ICLR 2018 paper by Wu Lin, Nicolas Hubacher and Mohammad Emtiyaz Khan)
+This is an implementation of Variational Message Passing for Structured VAE in pyTorch (ICLR 2018 paper by Wu Lin, Nicolas Hubacher and Mohammad Emtiyaz Khan)
 
 The main file is gmmsvae and it is heavily commented to help understand the model
 and the relationship calculations to the equations in the paper.
